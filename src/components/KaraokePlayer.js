@@ -7,6 +7,7 @@ import {
   Platform,
   PermissionsAndroid,
   Alert,
+  ScrollView,
 } from 'react-native';
 import Sound from 'react-native-sound';
 import AudioRecord from 'react-native-audio-record';
@@ -33,15 +34,24 @@ const KaraokePlayer = () => {
   }, []);
 
   const cleanup = () => {
-    if (backgroundTrack) {
-      backgroundTrack.release();
-    }
-    if (currentlyPlaying) {
-      currentlyPlaying.stop();
-      currentlyPlaying.release();
-    }
-    if (isRecording) {
-      AudioRecord.stop();
+    try {
+      if (backgroundTrack) {
+        backgroundTrack.stop();
+        backgroundTrack.release();
+      }
+      if (currentlyPlaying) {
+        currentlyPlaying.stop();
+        currentlyPlaying.release();
+      }
+      if (isRecording) {
+        AudioRecord.stop();
+      }
+      setIsRecording(false);
+      setIsPlaying(false);
+      setCurrentlyPlaying(null);
+      setCurrentPlayingId(null);
+    } catch (error) {
+      console.error('Error in cleanup:', error);
     }
   };
 
@@ -93,23 +103,38 @@ const KaraokePlayer = () => {
   };
 
   const startRecording = async () => {
-    if (!backgroundTrack) {
-      Alert.alert('Error', 'Background track not loaded yet');
-      return;
-    }
-
     try {
-      await AudioRecord.start();
-      backgroundTrack.play((success) => {
-        if (!success) {
-          Alert.alert('Playback Error', 'Failed to play background track');
-        }
-        setIsPlaying(false);
-      });
+      if (currentlyPlaying) {
+        currentlyPlaying.stop();
+        currentlyPlaying.release();
+        setCurrentlyPlaying(null);
+        setCurrentPlayingId(null);
+      }
+
+      const hasPermission = await checkPermission();
+      if (!hasPermission) return;
+
+      const options = {
+        sampleRate: 44100,
+        channels: 2,
+        bitsPerSample: 16,
+        audioSource: 6,
+        wavFile: `recording-${Date.now()}.wav`
+      };
+
+      AudioRecord.init(options);
+      AudioRecord.start();
+
+      // Start background track if it exists
+      if (backgroundTrack) {
+        backgroundTrack.play();
+        backgroundTrack.setVolume(volume);
+      }
+
       setIsRecording(true);
       setIsPlaying(true);
     } catch (error) {
-      console.error('Failed to start recording:', error);
+      console.error('Error starting recording:', error);
       Alert.alert('Error', 'Failed to start recording');
     }
   };
@@ -119,24 +144,25 @@ const KaraokePlayer = () => {
 
     try {
       const audioFile = await AudioRecord.stop();
-      backgroundTrack.stop();
+      if (backgroundTrack) {
+        backgroundTrack.stop();
+      }
       setIsRecording(false);
       setIsPlaying(false);
       
-      const newRecordingId = Date.now();
+      const newRecordingId = Date.now().toString();
       const newRecording = {
         id: newRecordingId,
         path: audioFile,
         name: `Recording ${recordings.length + 1}`,
       };
 
-      // Initialize pitch for this recording
       setRecordingPitches(prev => ({
         ...prev,
         [newRecordingId]: 0
       }));
       
-      setRecordings([...recordings, newRecording]);
+      setRecordings(prevRecordings => [...prevRecordings, newRecording]);
       console.log('Recording saved:', audioFile);
       Alert.alert('Success', 'Recording saved successfully!');
     } catch (error) {
@@ -146,56 +172,97 @@ const KaraokePlayer = () => {
   };
 
   const playRecording = (recording) => {
-    if (currentlyPlaying) {
-      currentlyPlaying.stop();
-      currentlyPlaying.release();
-      setCurrentlyPlaying(null);
-      setCurrentPlayingId(null);
-    }
+    try {
+      if (currentlyPlaying) {
+        currentlyPlaying.stop();
+        currentlyPlaying.release();
+        setCurrentlyPlaying(null);
+        setCurrentPlayingId(null);
+      }
 
-    setFinishedPlaying(prev => ({
-      ...prev,
-      [recording.id]: false
-    }));
-
-    const pitch = recordingPitches[recording.id] || 0;
-    const sound = new Sound(recording.path, '', (error) => {
-      if (error) {
-        console.log('Failed to load recording', error);
-        Alert.alert('Error', 'Failed to load recording');
+      if (isRecording) {
+        Alert.alert('Warning', 'Please stop recording before playing');
         return;
       }
 
-      try {
-        sound.setPitch(Math.pow(2, pitch / 12));
-        sound.setVolume(volume);
-        
-        // Set numberOfLoops to 0 to play only once
-        sound.setNumberOfLoops(0);
-        
-        sound.play((success) => {
-          if (success) {
-            console.log('Successfully finished playing');
-            setIsPaused(true);
+      setFinishedPlaying(prev => ({
+        ...prev,
+        [recording.id]: false
+      }));
+
+      const sound = new Sound(recording.path, '', (error) => {
+        if (error) {
+          console.error('Failed to load recording:', error);
+          Alert.alert('Error', 'Failed to load recording');
+          return;
+        }
+
+        try {
+          sound.setPitch(Math.pow(2, (recordingPitches[recording.id] || 0) / 12));
+          sound.setVolume(volume);
+          sound.setNumberOfLoops(-1);
+          
+          sound.play((success) => {
+            if (!success) {
+              console.error('Playback failed');
+              setCurrentlyPlaying(null);
+              setCurrentPlayingId(null);
+              setFinishedPlaying(prev => ({
+                ...prev,
+                [recording.id]: true
+              }));
+            }
+          });
+
+          setCurrentlyPlaying(sound);
+          setCurrentPlayingId(recording.id);
+          setIsPaused(false);
+        } catch (err) {
+          console.error('Error during playback setup:', err);
+          Alert.alert('Error', 'Failed to setup playback');
+        }
+      });
+    } catch (error) {
+      console.error('Error in playRecording:', error);
+      Alert.alert('Error', 'Failed to play recording');
+    }
+  };
+
+  const togglePlayPause = (recording) => {
+    if (currentlyPlaying && currentPlayingId === recording.id) {
+      if (isPaused) {
+        currentlyPlaying.setNumberOfLoops(-1); // Set to loop continuously when resuming
+        currentlyPlaying.play((success) => {
+          if (!success) {
             setCurrentlyPlaying(null);
             setCurrentPlayingId(null);
             setFinishedPlaying(prev => ({
               ...prev,
               [recording.id]: true
             }));
-          } else {
-            console.log('Playback failed due to audio decoding errors');
           }
         });
-
-        setCurrentlyPlaying(sound);
-        setCurrentPlayingId(recording.id);
         setIsPaused(false);
-      } catch (err) {
-        console.error('Error during playback setup:', err);
-        Alert.alert('Error', 'Failed to setup playback');
+      } else {
+        currentlyPlaying.pause();
+        setIsPaused(true);
       }
-    });
+    } else {
+      playRecording(recording);
+    }
+  };
+
+  const stopPlayback = (recording) => {
+    if (currentlyPlaying && currentPlayingId === recording.id) {
+      currentlyPlaying.stop();
+      setCurrentlyPlaying(null);
+      setCurrentPlayingId(null);
+      setIsPaused(false);
+      setFinishedPlaying(prev => ({
+        ...prev,
+        [recording.id]: true
+      }));
+    }
   };
 
   const deleteRecording = (recordingId) => {
@@ -220,32 +287,6 @@ const KaraokePlayer = () => {
       delete newFinished[recordingId];
       return newFinished;
     });
-  };
-
-  const togglePlayPause = (recording) => {
-    if (currentlyPlaying && currentPlayingId === recording.id) {
-      if (isPaused) {
-        // When resuming, make sure to set numberOfLoops to 0
-        currentlyPlaying.setNumberOfLoops(0);
-        currentlyPlaying.play((success) => {
-          if (success) {
-            setIsPaused(true);
-            setCurrentlyPlaying(null);
-            setCurrentPlayingId(null);
-            setFinishedPlaying(prev => ({
-              ...prev,
-              [recording.id]: true
-            }));
-          }
-        });
-        setIsPaused(false);
-      } else {
-        currentlyPlaying.pause();
-        setIsPaused(true);
-      }
-    } else {
-      playRecording(recording);
-    }
   };
 
   const getPlayButtonText = (recordingId) => {
@@ -283,19 +324,19 @@ const KaraokePlayer = () => {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Karaoke Player</Text>
+      <Text style={styles.title}>🎤 Karaoke Player</Text>
       
       <TouchableOpacity
-        style={[styles.button, isRecording && styles.buttonActive]}
+        style={[styles.mainButton, isRecording && styles.mainButtonActive]}
         onPress={isRecording ? stopRecording : startRecording}
       >
-        <Text style={styles.buttonText}>
-          {isRecording ? 'Stop' : 'Start'} Recording
+        <Text style={styles.mainButtonText}>
+          {isRecording ? '⏹️ Stop Recording' : '🎙️ Start Recording'}
         </Text>
       </TouchableOpacity>
 
       <View style={styles.volumeContainer}>
-        <Text style={styles.volumeText}>Background Music Volume</Text>
+        <Text style={styles.sectionTitle}>🔊 Background Music Volume</Text>
         <Slider
           style={styles.slider}
           minimumValue={0}
@@ -303,25 +344,38 @@ const KaraokePlayer = () => {
           value={volume}
           onValueChange={handleVolumeChange}
           minimumTrackTintColor="#1DB954"
-          maximumTrackTintColor="#000000"
+          maximumTrackTintColor="#E0E0E0"
+          thumbTintColor="#1DB954"
         />
       </View>
 
       {isPlaying && (
-        <Text style={styles.statusText}>
-          Recording in progress...
-        </Text>
+        <View style={styles.statusContainer}>
+          <Text style={styles.statusText}>
+            🎤 Recording in progress...
+          </Text>
+          <View style={styles.recordingIndicator} />
+        </View>
       )}
 
       <View style={styles.recordingsList}>
-        <Text style={styles.recordingsTitle}>Saved Recordings</Text>
-        {recordings.map((recording) => (
-          <View key={recording.id} style={styles.recordingItem}>
-            <View style={styles.recordingInfo}>
-              <Text style={styles.recordingName}>{recording.name}</Text>
+        <Text style={styles.sectionTitle}>📝 Saved Recordings</Text>
+        <ScrollView style={styles.scrollView}>
+          {recordings.map((recording) => (
+            <View key={recording.id} style={styles.recordingCard}>
+              <View style={styles.recordingHeader}>
+                <Text style={styles.recordingName}>{recording.name}</Text>
+                <TouchableOpacity
+                  style={[styles.deleteButton]}
+                  onPress={() => deleteRecording(recording.id)}
+                >
+                  <Text style={styles.deleteButtonText}>🗑️</Text>
+                </TouchableOpacity>
+              </View>
+
               <View style={styles.pitchControl}>
                 <Text style={styles.pitchText}>
-                  Pitch: {recordingPitches[recording.id] || 0} semitones
+                  🎵 Pitch: {recordingPitches[recording.id] || 0} semitones
                 </Text>
                 <Slider
                   style={styles.pitchSlider}
@@ -331,32 +385,37 @@ const KaraokePlayer = () => {
                   step={1}
                   onValueChange={(value) => adjustPitch(recording.id, value)}
                   minimumTrackTintColor="#1DB954"
-                  maximumTrackTintColor="#000000"
+                  maximumTrackTintColor="#E0E0E0"
+                  thumbTintColor="#1DB954"
                 />
               </View>
+
+              <View style={styles.controlsContainer}>
+                <TouchableOpacity
+                  style={[
+                    styles.playButton,
+                    currentPlayingId === recording.id && !isPaused && styles.activeButton,
+                    finishedPlaying[recording.id] && styles.playAgainButton
+                  ]}
+                  onPress={() => togglePlayPause(recording)}
+                >
+                  <Text style={styles.buttonText}>
+                    {getPlayButtonText(recording.id)}
+                  </Text>
+                </TouchableOpacity>
+
+                {currentPlayingId === recording.id && !isPaused && (
+                  <TouchableOpacity
+                    style={styles.stopButton}
+                    onPress={() => stopPlayback(recording)}
+                  >
+                    <Text style={styles.buttonText}>⏹️ Stop</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
             </View>
-            <View style={styles.recordingControls}>
-              <TouchableOpacity
-                style={[
-                  styles.controlButton,
-                  currentPlayingId === recording.id && !isPaused && styles.activeButton,
-                  finishedPlaying[recording.id] && styles.playAgainButton
-                ]}
-                onPress={() => togglePlayPause(recording)}
-              >
-                <Text style={styles.controlButtonText}>
-                  {getPlayButtonText(recording.id)}
-                </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.controlButton, styles.deleteButton]}
-                onPress={() => deleteRecording(recording.id)}
-              >
-                <Text style={styles.controlButtonText}> Delete</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        ))}
+          ))}
+        </ScrollView>
       </View>
     </View>
   );
@@ -365,119 +424,172 @@ const KaraokePlayer = () => {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: '#F5FCFF',
     padding: 20,
+    backgroundColor: '#F8F9FA',
   },
   title: {
     fontSize: 28,
     fontWeight: 'bold',
-    marginBottom: 40,
-    color: '#1DB954',
+    marginBottom: 24,
+    textAlign: 'center',
+    color: '#2C3E50',
+    letterSpacing: 0.5,
   },
-  button: {
+  mainButton: {
     backgroundColor: '#1DB954',
-    paddingHorizontal: 40,
-    paddingVertical: 15,
-    borderRadius: 25,
-    marginBottom: 30,
-    elevation: 3,
+    padding: 16,
+    borderRadius: 30,
+    marginBottom: 24,
+    alignItems: 'center',
+    elevation: 4,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
   },
-  buttonActive: {
-    backgroundColor: '#E74C3C',
+  mainButtonActive: {
+    backgroundColor: '#DC3545',
   },
-  buttonText: {
-    color: 'white',
-    fontSize: 20,
+  mainButtonText: {
+    color: '#FFFFFF',
+    fontSize: 18,
     fontWeight: 'bold',
+    letterSpacing: 0.5,
+  },
+  sectionTitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    marginBottom: 12,
+    color: '#2C3E50',
+    letterSpacing: 0.3,
   },
   volumeContainer: {
-    width: '100%',
-    marginBottom: 20,
-  },
-  volumeText: {
-    fontSize: 16,
-    marginBottom: 10,
-    color: '#666',
-    textAlign: 'center',
+    backgroundColor: '#FFFFFF',
+    padding: 16,
+    borderRadius: 16,
+    marginBottom: 24,
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 2,
   },
   slider: {
     width: '100%',
     height: 40,
   },
+  statusContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 24,
+  },
   statusText: {
-    marginTop: 20,
-    color: '#1DB954',
+    color: '#DC3545',
     fontSize: 16,
-    fontWeight: '500',
+    fontWeight: '600',
+    marginRight: 8,
+  },
+  recordingIndicator: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: '#DC3545',
+    opacity: 1,
+    animationName: 'pulse',
+    animationDuration: '1.5s',
+    animationIterationCount: 'infinite',
   },
   recordingsList: {
-    width: '100%',
-    marginTop: 20,
+    flex: 1,
   },
-  recordingsTitle: {
-    fontSize: 20,
-    fontWeight: 'bold',
-    marginBottom: 10,
+  scrollView: {
+    flex: 1,
   },
-  recordingItem: {
+  recordingCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 12,
+    elevation: 3,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 3,
+  },
+  recordingHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    padding: 10,
-    backgroundColor: '#fff',
-    borderRadius: 8,
-    marginBottom: 8,
-    shadowColor: '#000',
-    shadowOffset: {
-      width: 0,
-      height: 2,
-    },
-    shadowOpacity: 0.25,
-    shadowRadius: 3.84,
-    elevation: 5,
-  },
-  recordingInfo: {
-    flex: 1,
+    marginBottom: 12,
   },
   recordingName: {
-    fontSize: 16,
-    marginBottom: 4,
-  },
-  recordingControls: {
-    flexDirection: 'row',
-  },
-  controlButton: {
-    padding: 8,
-    marginLeft: 8,
-    backgroundColor: '#1DB954',
-    borderRadius: 4,
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#2C3E50',
+    flex: 1,
   },
   deleteButton: {
-    backgroundColor: '#FF4136',
+    padding: 8,
+    borderRadius: 20,
   },
-  controlButtonText: {
-    color: '#fff',
-  },
-  activeButton: {
-    backgroundColor: '#157a3b',
-  },
-  playAgainButton: {
-    backgroundColor: '#4CAF50',
+  deleteButtonText: {
+    fontSize: 20,
   },
   pitchControl: {
-    marginTop: 8,
-    width: '100%',
+    marginBottom: 16,
+  },
+  pitchText: {
+    fontSize: 14,
+    color: '#6C757D',
+    marginBottom: 8,
   },
   pitchSlider: {
     width: '100%',
     height: 40,
   },
-  pitchText: {
-    fontSize: 12,
-    color: '#666',
-    marginBottom: 4,
+  controlsContainer: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: 12,
+  },
+  playButton: {
+    backgroundColor: '#1DB954',
+    paddingVertical: 10,
+    paddingHorizontal: 24,
+    borderRadius: 25,
+    minWidth: 120,
+    alignItems: 'center',
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.2,
+    shadowRadius: 2,
+  },
+  activeButton: {
+    backgroundColor: '#157a3b',
+  },
+  stopButton: {
+    backgroundColor: '#DC3545',
+    paddingVertical: 10,
+    paddingHorizontal: 24,
+    borderRadius: 25,
+    minWidth: 120,
+    alignItems: 'center',
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.2,
+    shadowRadius: 2,
+  },
+  playAgainButton: {
+    backgroundColor: '#4CAF50',
+  },
+  buttonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+    letterSpacing: 0.3,
   },
 });
 
